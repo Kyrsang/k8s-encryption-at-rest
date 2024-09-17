@@ -1,0 +1,117 @@
+name: Setup Kubernetes Encryption
+
+on:
+  # push:
+  #   branches:
+  #     - main  
+  workflow_dispatch:
+
+jobs:
+  setup-encryption:
+    runs-on: ubuntu-latest  
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.7
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Install etcdctl
+        run: |
+          ETCD_VERSION=$(curl -s https://github.com/etcd-io/etcd/releases/latest | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -n 1)
+          curl -L "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" -o etcd.tar.gz
+          tar -xvf etcd.tar.gz --strip-components=1 -C /usr/local/bin
+          chmod +x /usr/local/bin/etcdctl
+
+      - name: Generate and Configure Encryption
+        run: |
+          #!/bin/bash
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Define variables
+          ENCRYPTION_KEY_PATH="/etc/kubernetes/enc"
+          ENCRYPTION_KEY_FILE="$ENCRYPTION_KEY_PATH/key"
+          ENCRYPTION_CONFIG_FILE="$ENCRYPTION_KEY_PATH/enc.yaml"
+          MANIFEST_FILE="/etc/kubernetes/manifests/kube-apiserver.yaml"
+          KUBE_APISERVER_IP="10.20.30.40"  # Replace with your API server's IP address
+
+          # Create encryption directory if it doesn't exist
+          mkdir -p "$ENCRYPTION_KEY_PATH"
+
+          # Generate a 32-byte random encryption key and base64 encode it
+          ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64)
+          echo "$ENCRYPTION_KEY" > "$ENCRYPTION_KEY_FILE"
+
+          # Create the encryption configuration file
+          cat <<EOF > "$ENCRYPTION_CONFIG_FILE"
+          ---
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: EncryptionConfiguration
+          resources:
+            - resources:
+                - secrets
+                - configmaps
+              providers:
+                - aescbc:
+                    keys:
+                      - name: key1
+                        secret: $ENCRYPTION_KEY
+                - identity: {}
+          EOF
+
+          # Set permissions on the encryption key and config file
+          chmod 600 "$ENCRYPTION_KEY_FILE"
+          chmod 600 "$ENCRYPTION_CONFIG_FILE"
+
+          # Edit the kube-apiserver manifest
+          if ! grep -q "--encryption-provider-config=$ENCRYPTION_CONFIG_FILE" "$MANIFEST_FILE"; then
+            sed -i "/^\\s*containers:/,/^\\s*volumes:/ { 
+              /kube-apiserver/!b 
+              :a 
+              N 
+              /--encryption-provider-config=/!ba 
+              i\\ - --encryption-provider-config=$ENCRYPTION_CONFIG_FILE\\ 
+            }" "$MANIFEST_FILE"
+          fi
+
+          if ! grep -q "name: enc" "$MANIFEST_FILE"; then
+            sed -i "/^\\s*volumeMounts:/ a\\
+              - name: enc\\n      mountPath: /etc/kubernetes/enc\\n      readOnly: true
+            " "$MANIFEST_FILE"
+          fi
+
+          if ! grep -q "name: enc" "$MANIFEST_FILE" || ! grep -q "path: $ENCRYPTION_KEY_PATH" "$MANIFEST_FILE"; then
+            sed -i "/^\\s*volumes:/ a\\
+            - name: enc\\n    hostPath:\\n      path: $ENCRYPTION_KEY_PATH\\n      type: DirectoryOrCreate
+            " "$MANIFEST_FILE"
+          fi
+
+          # Restart the kube-apiserver (this may depend on your system)
+          # This command may need to be replaced with an appropriate one for your environment
+          sudo systemctl restart kubelet
+
+          # Print completion message
+          echo "Encryption setup completed. Ensure all control plane hosts are configured similarly."
+
+      - name: Create and Verify Secret
+        run: |
+          #!/bin/bash
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Create a secret
+          kubectl create secret generic secret1 -n default --from-literal=mykey=mydata
+
+          # Use etcdctl to retrieve the secret from etcd
+          echo "Retrieving the secret from etcd to verify encryption..."
+          ETCDCTL_API=3 etcdctl \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt   \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key  \
+            get /registry/secrets/default/secret1 | hexdump -C
+
+          # Verify the secret can be decrypted via kubectl
+          kubectl get secret secret1 -n default -o yaml
